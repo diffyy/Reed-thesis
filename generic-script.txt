@@ -1,0 +1,292 @@
+#This R script uses random forests models to help identify potentially important taxa in microbiome data involving two states (ie: healthy or diseased)
+#
+#It is free to use for all non-commercial purposes, as long as it is cited
+#Please email any questions about the script or thesis to Moira Differding at mkdiff@gmail.com 
+#
+#All code was run in either the Linux or Mac OS R shell
+#
+#Before running this, make sure you have python (2.7 at minimum) and R installed, and at least 1 gb free RAM
+#
+#This script requires R pkgs ggplot2, vegan, dplyr, magrittr, grid, reshape2, randomForest, knitr, caret, pROC, doMC, ROCR, tidyr, VSURF, and Hmisc
+#
+#Not all of the above chunks are explicitly represented in this code, but are included because they were necessary for pkg compatibility issues
+#
+#Not all setup chunks are necessary to run script, but were required to run it on the Reed Comp Bio computers (Linux)
+#
+#For reference, 117 control samples and 117 Crohn's disease patient samples are used for the training data.
+#The test data included 77 controls and 246 CD samples.
+#Training data SHOULD include an equal ratio, but this is not required for the test data, which is the case here.
+#
+#BEGIN SCRIPT
+#
+#BEGIN SETUP CHUNKS
+#
+#Setup Chunk 1: Required to run the non-base R pkgs on Reed Computational Bio computers
+#
+#Checks what R module library you are currently in--this should be the path to the folder where you store R pkgs
+.libPaths()
+#Changes the R module library to the folder of your choice 
+.libPaths("/path/to/your/R/modules/goes/here")
+#Loads the pkgs
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(magrittr)
+library(grid)
+library(reshape2)
+library(randomForest)
+library(knitr)
+library(caret)
+library(pROC)
+library(doMC)
+library(ROCR)
+library(tidyr)
+library(VSURF)
+library(Hmisc)
+
+#Checks working directory 
+getwd()
+#Sets working directory to the file server where results were stored
+setwd("~/results")
+
+#rename microbiome data for easier processing
+file_path <- "name_of_microbiome_data_table_file.csv"
+
+#import microbiome data into R
+rawdata<-read.csv(file_path)
+
+#OPTIONAL--Subset the data of interest from full dataset.
+#This line keeps only terminal ileum biopsies.
+termildata<-subset(rawdata, biopsy_location=="terminal_ileum") 
+
+#OPTIONAL--Subset the data of interest from reduced dataset.
+#This line keeps only terminal ileum biopsies from healthy ("no") patients OR patients with Crohn's Disease ("CD") 
+termildata_cdno<-subset(termildata, diagnosis=="CD"| diagnosis=="no")
+
+#OPTIONAL--Subset the data of interest from reduced dataset.
+#This line keeps only patients with no recent history of antibiotics ("FALSE")
+ildataraw<-subset(termildata_cdno, antibiotics=="FALSE")
+
+#OPTIONAL--Subset the data of interest from reduced dataset.
+#This line keeps only patients from a specified cohort ("RISK")
+ildataraw<-subset(ildataraw, collection=="RISK")
+
+#OPTIONAL--Remove unused levels from data and turn inputs into factors
+#These 3 lines remove all unrepresented levels of diagnoses (UC, IC), cohorts (OSCCAR, PRISM, etc), and antibiotic statuses (TRUE) from data 
+ildataraw$diagnosis<-factor(ildataraw$diagnosis)
+ildataraw$collection<-factor(ildataraw$collection)
+ildataraw$antibiotics<-factor(ildataraw$antibiotics)
+
+#Splits data into two categories by diagnosis, either CD (Crohn's disease) or no (control)
+ilcd<-subset(ildataraw, diagnosis=="CD")
+ilcontrol<-subset(ildataraw, diagnosis=="no")
+
+#Create empty matrix to store summary of results in
+#In this script, 50 random forest models (nrow) are built and 5 columns (ncol) of data are stored for each
+aucmatrix <- matrix(nrow=50, ncol=5) 
+
+#OPTIONAL--create empty matrices to store the names of all training samples for each category
+trainmatrix.cd <- matrix(nrow=117, ncol=50) 
+trainmatrix.no <- matrix(nrow=117, ncol=50)
+
+#Create empty matrices to store the probability of being CD each random forest (RF) model assigns to its given samples and the actual class of each sample 
+avgpred<-matrix(nrow=246, ncol=50)
+avglabel<- matrix(nrow=246, ncol=50)
+
+#OPTIONAL--make and initiate cluster to use multiple cores when processing data 
+cl<-makeCluster(7,type="FORK")
+cl
+
+#Begin for loop to run 50 random forest models, each randomly sampling from your data
+for(i in 1:50) {
+#set seed to change for each run of for-loop so that sampled data is truly random
+set.seed(99+i)
+
+#randomly sample ~60 percent of CD data to make training data
+il.cd.train = ilcd[sample(nrow(ilcd), 63, replace=FALSE), ]
+#put samples not randomly selected for training set in the test data
+il.cd.test<-anti_join(ilcd, il.cd.train, by = "sample_id")
+
+#randomly sample ~60 percent of control data to make training data
+il.no.train = ilcontrol[sample(nrow(ilcontrol), 63, replace=FALSE), ]
+#put samples not randomly selected for training set in the test data
+il.no.test<-anti_join(ilcontrol, il.no.train, by = "sample_id")
+
+#combine CD and control samples to form seperate training and test sets
+train.il<-rbind(il.cd.train, il.no.train)
+test.il<-rbind(il.cd.test, il.no.test)
+
+#run VSURF pkg to select the most likely taxa to be important using small RFs
+il.vsurf <- VSURF(x=train.il[,2:787], y=train.il[,824], ntree = 10000, nfor.thres = 20, nfor.interp = 10, nfor.pred = 10, parallel=TRUE, ncores=7, clusterType="FORK")
+#plot VSURF results to check that they look normal
+plot(il.vsurf)
+#create name for VSURF plot to save to file with run # attached
+vsurfplotfilename<- paste("vsurfplot-run-", i, ".png", sep="")
+
+#change directory to folder where VSURF plots are stored and save plot as PNG
+setwd("~/ileum-results/vsurfplots")
+png(vsurfplotfilename)
+plot(il.vsurf)
+dev.off()
+
+#change wd back to results folder
+setwd("~/ileum-results")
+
+#Get taxa/variables VSURF labeled the most important
+vars<-il.vsurf$varselect.pred
+
+#adjust VSURF variable numbers by 1 to account for sample IDs in the first column of the regular dataset
+vars.adjusted <- vars+1
+
+#subset only VSURF variables from dataset
+ilselect <-subset(train.il, select=vars.adjusted)
+
+#get and print the names of the VSURF selected taxa
+il.vsurf.names <- names(ilselect)
+print(il.vsurf.names)
+
+#combine VSURF variable names for use in RF formula
+ilvsurfNames <- paste(il.vsurf.names, collapse = "+")
+
+#create formula for RF using VSURF variables as a function of diagnosis
+rfil.form <- as.formula(paste("diagnosis", ilvsurfNames, sep = " ~ "))
+
+#label the run # for summary txt file
+run <- paste("RF", i, sep = "")
+
+#run RF model with above formula on the training data
+rf1 <- randomForest(rfil.form, train.il, ntree=120000, importance=T, keep.forest=TRUE, proximity=TRUE)   
+
+#store and make rf and VSURF formulas suitable text for summary table
+rf1call<-as.character(rf1$call)
+vsurfcall<-as.character(il.vsurf$call)
+rfcall0<-paste(rf1call, collapse = '-')
+vsurfcall0<-paste(vsurfcall, collapse = '-')
+modelcall<- paste(vsurfcall0,rfcall0, sep="---")
+
+#plot RF error to make sure forest is stable
+plot(rf1)
+
+#OPTIONAL--Assign proximity values to samples for plotting on outlier matrix 
+outliermatrix <-outlier(rf1,cls=train.il$diagnosis)
+proxvalue <- unname(outliermatrix)
+outlierplotdata <- cbind(train.il, proxvalue)
+outlierindex<-seq_along(outlierplotdata$diagnosis)
+outlierplotdata2 <- cbind(outlierplotdata, outlierindex)
+
+#plot outliers
+outlierplotfinal<-ggplot(data=outlierplotdata2, aes(x=outlierindex, y=proxvalue, color=diagnosis))+geom_point()+xlab("Index")+ ylab("Outlying measure")+ geom_hline(aes(yintercept = quantile(proxvalue, .95),fill="95line"), lwd=0.75,lty=2, col="gray", show.legend=FALSE, alpha=0.8)+guides(color= guide_legend(title="Diagnosis"))
+
+plot(outlierplotfinal)
+
+#make file name for RF error plot
+rfplotfilename<- paste("rferrorplot-run-", i, ".png", sep="")
+
+#set wd to store RF error plot in 
+setwd("~/ileum-results/rfplots")  
+png(rfplotfilename)
+plot(rf1)
+dev.off() 
+setwd("~/ileum-results")
+
+#name outlier matrix plot 
+matrixfilename<- paste("outliermatrix-run", i, ".txt", sep="")
+rfoutlierfilename<- paste("outlierplot-run-", i, ".png", sep="")
+
+#store sample IDs in training matrix made before for-loop 
+trainmatrix.cd[,i] <- il.cd.train$sample_id
+trainmatrix.no[,i] <- il.no.train$sample_id
+
+#set wd to folder for outlier plots and save plot as PNG
+setwd("~/ileum-results/outlierplots")
+png(rfoutlierfilename)
+plot(outlierplotfinal)
+dev.off() 
+setwd("~/ileum-results")
+
+#write txt table with outlier values and sample IDs
+setwd("~/ileum-results/outliermatrix")
+write.table(x=outliermatrix, file=matrixfilename)
+setwd("~/ileum-results")
+   
+#look at variable important plot to ensure taxa names are correct
+varImpPlot(rf1, type=2, sort=TRUE)
+  
+#use ROCR and RF model to assign test data classes and see how accurate it is 
+il.rf.pr = predict(rf1,type="prob",newdata=test.il)[,2]
+
+il.rf.pred = prediction(il.rf.pr, test.il$diagnosis)
+
+il.rf.perf = performance(il.rf.pred,"tpr","fpr")
+
+#plot ROC curve to see if model worked
+plot(il.rf.perf,main=run, col=2 ,lwd=2)+abline(a=0,b=1,lwd=2,lty=2,col="gray")
+
+#for every random forest model of 50, record the predictions of RF ROC curve and true class label 
+runpred <- il.rf.pr
+runlabel<- test.il$diagnosis
+
+#store predictions and class labels for every RF run in matrix
+avgpred[,i] <- runpred
+avglabel[,i] <- runlabel
+
+#calculate AUC for ROC curve of RF model
+auc <- performance(il.rf.pred,"auc")
+auc <- unlist(slot(auc, "y.values"))
+
+#round AUC number to 6 digits for better visibility on plot
+minauc<-min(round(auc, digits = 6))
+
+#make labels for AUC and ROC curve plot
+filename<- paste("AUCPLOT-run", i, ".png", sep="")
+auclabelrun<-paste("AUC=", minauc, sep="")
+
+#plot the ROC curve with AUC value
+plot(il.rf.perf,main=run, col=2 ,lwd=2)+abline(a=0,b=1,lwd=2,lty=2,col="gray")+text(1,0.15,labels=auclabelrun,adj=1)
+
+#save ROC curve and AUC value
+setwd("~/ileum-results/aucplots")
+png(filename)
+plot(il.rf.perf,main=run, col=2 ,lwd=2)+abline(a=0,b=1,lwd=2,lty=2,col="gray")+text(1,0.15,labels=auclabelrun,adj=1)
+dev.off() 
+setwd("~/ileum-results")
+
+#store the run #, the AUC value, the VSURF variable names, the filename of the RF plot, and RF code in summary table
+aucmatrix[i,] <- c(run,minauc,ilvsurfNames,filename,modelcall)
+
+}
+  
+#use ROCR to make average predictions of data using all 50 RF models and bootstrap confidence intervals
+il.rf.pred.avg = prediction(avgpred, avglabel)
+
+il.rf.perf.avg = performance(il.rf.pred.avg,"tpr","fpr")
+
+aucavg <- performance(il.rf.pred.avg,"auc")
+aucavg <- unlist(slot(aucavg, "y.values"))
+meanaucavg <-mean(round(aucavg, digits = 6))
+
+auclabelavg<-paste("AUC=", meanaucavg, sep="")
+
+#print summary results table
+print(aucmatrix)
+
+#preparing TPR and FPR values for plotting an average and CIs
+runperfx<- unlist(slot(il.rf.perf.avg, "x.values"))
+runperfy<- unlist(slot(il.rf.perf.avg, "y.values"))
+ggplotdf<-data.frame(x=runperfx,y=runperfy)
+
+#plot average ROC curve and normal CIs
+ggplot(ggplotdf, aes(x, y)) + stat_summary(fun.data=mean_cl_normal, geom="ribbon", fill="gray70")+ stat_summary(fun.y = mean, geom="line", color="red") + geom_abline(intercept=0, slope=1, linetype="dashed", color="gray") + xlab("FPR") + ggtitle("Rectum ROC Curve")+ ylab("TPR") + geom_label(aes(x = 0.75, y = 0.1, label = auclabelavg), fill = "white")+xlim(0,1)+ylim(0,1)
+#save average ROC curve and AUC value plot to file
+png("4-13-seed100-10kVSURF-201010-80krftrees-20runs-avgplot.png")
+ggplot(ggplotdf, aes(x, y)) + stat_summary(fun.data=mean_cl_normal, geom="ribbon", fill="gray70")+ stat_summary(fun.y = mean, geom="line", color="red") + geom_abline(intercept=0, slope=1, linetype="dashed", color="gray") + xlab("FPR") + ggtitle("Rectum ROC Curve")+ ylab("TPR") + geom_label(aes(x = 0.75, y = 0.1, label = auclabelavg), fill = "white")+xlim(0,1)+ylim(0,1)
+dev.off()
+
+#save randomly sampled training data sample IDs to text files
+setwd("~/ileum-results/trainingdata")
+write.table(x=trainmatrix.cd, file="trainmatrix-cd.txt")
+write.table(x=trainmatrix.no, file="trainmatrix-no.txt")
+setwd("~/rectum-results")
+
+#write results summary table to file
+write.table(x=aucmatrix, file="results-summary-filename-here.txt")
